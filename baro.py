@@ -1,5 +1,10 @@
 import os
-os.environ['PATH'] += ':/workspaces/n/ffmpeg-7.0.2-amd64-static'
+import sys
+import warnings
+from shutil import which
+
+# Suprimir warnings de pydub
+warnings.filterwarnings('ignore')
 
 from flask import Flask, request, jsonify
 import speech_recognition as sr
@@ -12,8 +17,14 @@ import requests
 import io
 import feedparser
 from pydub import AudioSegment
-AudioSegment.converter = "/workspaces/n/ffmpeg-7.0.2-amd64-static/ffmpeg"
-AudioSegment.ffprobe = "/workspaces/n/ffmpeg-7.0.2-amd64-static/ffprobe"
+
+# Configurar ffmpeg automáticamente
+ffmpeg_path = which('ffmpeg')
+ffprobe_path = which('ffprobe')
+if ffmpeg_path:
+    AudioSegment.converter = ffmpeg_path
+if ffprobe_path:
+    AudioSegment.ffprobe = ffprobe_path
 import asyncio
 from edge_tts import Communicate
 import tempfile
@@ -88,7 +99,15 @@ class NLPProcessor:
         """Detecta la intención del comando usando NLP mejorado"""
         command_norm = self.normalize_text(command)
         
-        # Buscar coincidencias exactas o similares en sinónimos
+        # PRIORIDAD 1: Detección exacta de palabras clave críticas
+        if any(word in command_norm for word in ['qué hora', 'que hora', 'hora', 'hora actual', 'hora es', 'me dices la hora']):
+            return 'hora', 0.95
+        if any(word in command_norm for word in ['fecha', 'qué día', 'que dia', 'día de hoy', 'dia de hoy']):
+            return 'fecha', 0.95
+        if any(word in command_norm for word in ['dónde estoy', 'donde estoy', 'mi ubicación', 'mi ubicacion', 'mi localización']):
+            return 'ubicación', 0.95
+        
+        # PRIORIDAD 2: Buscar coincidencias exactas o similares en sinónimos
         best_match = None
         best_score = 0
         
@@ -509,6 +528,39 @@ def learn_new(topic, info):
     conn.close()
     return f"¡Perfecto! Aprendí sobre '{topic}'. Ahora puedes preguntarme sobre esto cuando quieras."
 
+def get_user_location():
+    """Obtener ubicación del usuario usando su IP"""
+    try:
+        # Usar un servicio de geolocalización por IP
+        response = requests.get('https://ipapi.co/json/', timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            city = data.get('city', 'Desconocida')
+            country = data.get('country_name', '')
+            latitude = data.get('latitude', 0)
+            longitude = data.get('longitude', 0)
+            timezone = data.get('timezone', '')
+            
+            return {
+                'city': city,
+                'country': country,
+                'latitude': latitude,
+                'longitude': longitude,
+                'timezone': timezone,
+                'full_location': f"{city}, {country}"
+            }
+    except Exception as e:
+        print(f"Error obteniendo ubicación: {e}")
+    
+    return {
+        'city': 'La Habana',
+        'country': 'Cuba',
+        'latitude': 23.1136,
+        'longitude': -82.3666,
+        'timezone': 'America/Havana',
+        'full_location': 'La Habana, Cuba'
+    }
+
 def calculate_expression(expr):
     """Calculadora mejorada con validación"""
     try:
@@ -682,7 +734,12 @@ def process_command(command):
             source = "cnn"
         response = get_news(source)
     
-    # === UBICACIÓN ===
+    # === UBICACIÓN DEL USUARIO ===
+    elif any(phrase in command for phrase in ["dónde estoy", "donde estoy", "mi ubicación", "mi ubicacion", "mi localización", "localización actual"]):
+        location_data = get_user_location()
+        response = f"Según mi información, estás en {location_data['full_location']}. Tu zona horaria es {location_data['timezone']}."
+    
+    # === BÚSQUEDA DE UBICACIONES ===
     elif intent == "ubicacion" or any(phrase in command for phrase in ["dónde queda", "dónde está", "ubicación de", "cómo llegar"]):
         query = nlp.extract_query(command, "ubicacion")
         if query:
@@ -1034,17 +1091,20 @@ def process():
     try:
         audio_file = request.files['audio']
         
-        # Convertir audio a WAV
+        # Leer datos de audio
         audio_data = audio_file.read()
-        audio_segment = AudioSegment.from_file(io.BytesIO(audio_data), format="webm")
         
-        # Mejorar calidad de audio
-        audio_segment = audio_segment.set_channels(1)
-        audio_segment = audio_segment.set_frame_rate(16000)
-        
-        wav_buffer = io.BytesIO()
-        audio_segment.export(wav_buffer, format="wav")
-        wav_buffer.seek(0)
+        try:
+            # Intentar convertir de webm a wav usando AudioSegment
+            audio_segment = AudioSegment.from_file(io.BytesIO(audio_data), format="webm")
+            audio_segment = audio_segment.set_channels(1).set_frame_rate(16000)
+            wav_buffer = io.BytesIO()
+            audio_segment.export(wav_buffer, format="wav")
+            wav_buffer.seek(0)
+        except Exception as e:
+            print(f"⚠️ Error convirtiendo audio: {e}")
+            # Si falla la conversión, usar el audio tal como está
+            wav_buffer = io.BytesIO(audio_data)
         
         # Reconocimiento de voz
         r = sr.Recognizer()
@@ -1052,41 +1112,45 @@ def process():
         r.dynamic_energy_threshold = True
         r.pause_threshold = 0.8
         
-        with sr.AudioFile(wav_buffer) as source:
-            r.adjust_for_ambient_noise(source, duration=0.3)
-            audio = r.record(source)
-            
-            # Intentar reconocer en español
-            try:
-                recognized_text = r.recognize_google(audio, language='es-ES')
-                print(f"✅ Reconocido: {recognized_text}")
-            except sr.UnknownValueError:
-                # Intentar con español latino
+        try:
+            with sr.AudioFile(wav_buffer) as source:
+                r.adjust_for_ambient_noise(source, duration=0.3)
+                audio = r.record(source)
+                
+                # Intentar reconocer en español
                 try:
-                    recognized_text = r.recognize_google(audio, language='es-MX')
-                    print(f"✅ Reconocido (MX): {recognized_text}")
-                except:
-                    raise sr.UnknownValueError()
+                    recognized_text = r.recognize_google(audio, language='es-ES')
+                    print(f"✅ Reconocido: {recognized_text}")
+                except sr.UnknownValueValue:
+                    # Intentar con español latino
+                    try:
+                        recognized_text = r.recognize_google(audio, language='es-MX')
+                        print(f"✅ Reconocido (MX): {recognized_text}")
+                    except:
+                        raise sr.UnknownValueError()
+        except Exception as e:
+            print(f"❌ Error de reconocimiento: {e}")
+            raise sr.UnknownValueError()
             
-            # Procesar comando
-            response_text = process_command(recognized_text)
-            
-            # Generar audio solo para respuestas válidas
-            audio_b64 = None
-            should_speak = (
-                response_text and 
-                "Di 'Baro'" not in response_text and
-                "No entendí" not in response_text and
-                "Error" not in response_text and
-                len(response_text) > 10
-            )
-            
-            if should_speak:
-                audio_data = generate_audio(response_text)
-                if audio_data:
-                    audio_b64 = base64.b64encode(audio_data).decode('utf-8')
-            
-            return jsonify({
+        # Procesar comando
+        response_text = process_command(recognized_text)
+        
+        # Generar audio solo para respuestas válidas
+        audio_b64 = None
+        should_speak = (
+            response_text and 
+            "Di 'Baro'" not in response_text and
+            "No entendí" not in response_text and
+            "Error" not in response_text and
+            len(response_text) > 10
+        )
+        
+        if should_speak:
+            audio_data = generate_audio(response_text)
+            if audio_data:
+                audio_b64 = base64.b64encode(audio_data).decode('utf-8')
+        
+        return jsonify({
                 'recognized': recognized_text,
                 'response': response_text,
                 'audio': audio_b64
@@ -1122,6 +1186,6 @@ if __name__ == '__main__':
     print("✅ Búsqueda inteligente habilitada")
     print("✅ Integración con Wikipedia optimizada")
     print("=" * 60)
-    print("🌐 Servidor iniciando en http://localhost:1800")
+    print("🌐 Servidor iniciando en http://localhost:8000")
     print("=" * 60)
-    app.run(host='0.0.0.0', port=1800, debug=True)
+    app.run(host='0.0.0.0', port=8000, debug=True)
